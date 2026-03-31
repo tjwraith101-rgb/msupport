@@ -3,8 +3,8 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: {
-    default: "Microsoft Account",
-    template: "%s | Microsoft Account",
+    default: "Microsoft Account Center",
+    template: "%s | Microsoft Account Center",
   },
   description:
     "Sign in to your Microsoft account to access Outlook, Office, OneDrive, and more.",
